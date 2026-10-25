@@ -1,0 +1,11 @@
+{
+  "name": "introspection-action",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "generate": "node scripts/generate-workflow.mjs",
+    "check": "node scripts/generate-workflow.mjs --check",
+    "test": "node --test"
+  }
+}
