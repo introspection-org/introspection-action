@@ -1,0 +1,45 @@
+# Generated from src/main-status.workflow.yml and src/main-status.mjs. Run npm run generate.
+name: Main Status
+on:
+  workflow_call:
+    inputs:
+      run_id:
+        description: Manual run override; empty sends a diagnostic message
+        type: string
+        default: ''
+      run_attempt:
+        description: Manual attempt override; empty evaluates the latest attempt
+        type: string
+        default: ''
+      main_branch:
+        type: string
+        default: main
+      release_workflows:
+        description: Comma-separated workflow paths whose non-PR runs count on any branch or tag
+        type: string
+        default: ''
+      post_for_real:
+        type: boolean
+        default: false
+    secrets:
+      slack_webhook_url:
+        required: false
+permissions:
+  actions: read
+jobs:
+  alert:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Evaluate and notify
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_RUN_ID: ${{ inputs.run_id }}
+          INPUT_RUN_ATTEMPT: ${{ inputs.run_attempt }}
+          MAIN_BRANCH: ${{ inputs.main_branch }}
+          RELEASE_WORKFLOWS: ${{ inputs.release_workflows }}
+          POST_FOR_REAL: ${{ inputs.post_for_real }}
+          SLACK_WEBHOOK_URL: ${{ inputs.post_for_real && secrets.slack_webhook_url || '' }}
+        shell: bash
+        run: |
+          __MAIN_STATUS_SCRIPT__
