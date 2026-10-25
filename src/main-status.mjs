@@ -5,7 +5,7 @@ const positiveId = (value) => /^[1-9][0-9]*$/.test(String(value));
 const sameRepo = (a, b) => typeof a === 'string' && a.toLowerCase() === b.toLowerCase();
 const timestamp = (value) => typeof value === 'string' && /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/.test(value) && Number.isFinite(Date.parse(value));
 const compare = (a, b) => a.created_at.localeCompare(b.created_at) || Math.sign(a.id - b.id);
-const escapeSlack = (value) => String(value).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
+const escapeSlack = (value) => String(value).replaceAll(/[\r\n]/g, ' ').replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
 
 export class HistoryError extends Error {}
 
@@ -14,7 +14,7 @@ export function validateRun(run) {
       !Number.isSafeInteger(run.run_attempt) || run.run_attempt < 1 ||
       !timestamp(run.created_at) || !timestamp(run.updated_at) || !timestamp(run.run_started_at) ||
       typeof run.path !== 'string' || typeof run.head_branch !== 'string' ||
-      typeof run.event !== 'string' || typeof run.head_repository?.full_name !== 'string' ||
+      typeof run.event !== 'string' || (run.head_repository !== null && typeof run.head_repository?.full_name !== 'string') ||
       !/^[a-f0-9]{40}$/i.test(run.head_sha) ||
       !['completed', 'queued', 'in_progress', 'waiting', 'requested', 'pending'].includes(run.status) ||
       !(run.conclusion === null || typeof run.conclusion === 'string')) {

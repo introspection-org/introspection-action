@@ -212,3 +212,13 @@ test('a resolved edge does not inspect older irrelevant attempts', async () => {
   assert.deepEqual(await evaluate(target, api, options), { kind: 'red' });
   assert.equal(api.calls.length, 1);
 });
+
+test('deleted head repositories are excluded rather than poisoning history', async () => {
+  const deleted = validateRun(run(2, 20, 'failure', 21, { head_repository: null }));
+  assert.equal((await evaluateRuns(deleted, [])).kind, 'none');
+  assert.equal((await evaluateRuns(run(3, 30, 'success'), [deleted, run(1, 0, 'success')])).kind, 'none');
+});
+test('metadata cannot inject workflow command lines into logs', () => {
+  const text = render({ kind: 'red' }, run(2, 10, 'failure', 11, { head_commit: { author: { name: 'name\n::error::injected' } } }), options, 'CI\n::error::injected');
+  assert.doesNotMatch(text, /\n::error::/);
+});
