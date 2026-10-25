@@ -4,7 +4,7 @@ Shared GitHub automation with a reusable Main Status workflow. Callers own their
 
 ## Main Status caller
 
-Keep this workflow on the caller's default branch. Replace `REVIEWED_COMMIT_SHA` with the full reviewed commit SHA containing the reusable workflow.
+Keep this workflow on the caller's default branch. Replace `RELEASE_TAG` with a release tag, such as `v0.1.0`.
 
 ```yaml
 name: Main Status
@@ -27,7 +27,7 @@ permissions:
   actions: read
 jobs:
   alert:
-    uses: introspection-org/introspection-action/.github/workflows/main-status.yml@REVIEWED_COMMIT_SHA
+    uses: introspection-org/introspection-action/.github/workflows/main-status.yml@RELEASE_TAG
     with:
       run_id: ${{ inputs.run_id || '' }}
       run_attempt: ${{ inputs.run_attempt || '' }}
@@ -86,6 +86,6 @@ Set `MAIN_BRANCH` or `RELEASE_WORKFLOWS` for a caller with those overrides. Repl
 
 ## Versioning and rollback
 
-Callers pin a full reviewed commit SHA. Merge the shared implementation before merging a caller that references it, and update the caller's SHA after a squash or rebase changes the reviewed revision. Changes to inputs, verdict semantics, or notification behavior require review and tests before consumers update their pins. A rollback restores the caller's previous reviewed SHA or previous workflow implementation. No moving release tag is required for the pilot.
+Callers pin a release tag. Release Please keeps a release PR open from the Conventional Commits on `main`, and merging it creates the `vX.Y.Z` tag and GitHub release; a caller can reference a tag only after it exists. Changes to inputs, verdict semantics, or notification behavior require review and tests before callers move to the new tag. A rollback restores the caller's previous tag.
 
 Configure branch protection and required review through GitHub settings before adopting this workflow broadly. Those settings are separate from the workflow files.
