@@ -11,6 +11,8 @@ const api = new GitHub({ repository, token });
 const options = {
   repository, mainBranch: process.env.MAIN_BRANCH || 'main', serverUrl: 'https://github.com',
   releaseWorkflows: (process.env.RELEASE_WORKFLOWS || '').split(',').filter(Boolean),
+  reconcileWorkflows: (process.env.RECONCILE_WORKFLOWS || '').split(',').filter(Boolean),
+  statusWorkflow: process.env.STATUS_WORKFLOW || null, selfRunId: null,
 };
 const run = await api.run(id, attempt);
 const result = await evaluate(run, api, options);
