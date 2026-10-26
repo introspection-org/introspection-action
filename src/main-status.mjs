@@ -55,7 +55,14 @@ export class GitHub {
     if (String(run.id) !== String(id) || (attempt && String(run.run_attempt) !== String(attempt))) {
       throw new Error('GitHub returned a different run or attempt');
     }
-    return run;
+    if (!attempt) return run;
+    // An attempt reports its own creation time, while history reports the run's.
+    // Runs are ordered and attempts matched by the run's creation time.
+    const latest = validateRun(await this.get(`actions/runs/${id}`));
+    if (latest.id !== run.id || latest.workflow_id !== run.workflow_id) {
+      throw new Error('GitHub returned a different run or attempt');
+    }
+    return { ...run, created_at: latest.created_at };
   }
 }
 

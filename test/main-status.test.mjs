@@ -175,12 +175,34 @@ test('manual configuration rejects invalid IDs, attempts, and missing production
     assert.throws(() => configuration({ POST_FOR_REAL: 'false', GITHUB_EVENT_NAME: 'workflow_dispatch', ...extra }, {}));
   }
 });
-test('GitHub requests the requested attempt rather than the mutable latest run', async () => {
-  const api = new GitHub({ repository: options.repository, token: 'token', fetchImpl: async (url, init) => {
-    assert.match(url, /runs\/2\/attempts\/1$/); assert.equal(init.headers.authorization, 'Bearer token');
-    return { ok: true, json: async () => run(2, 10, 'failure') };
-  } });
-  assert.equal((await api.run(2, 1)).conclusion, 'failure');
+// Serves recorded API bodies by path, as GitHub returns them.
+const github = (responses) => new GitHub({ repository: options.repository, token: 'token', fetchImpl: async (url, init) => {
+  assert.equal(init.headers.authorization, 'Bearer token');
+  const path = url.slice(`https://api.github.com/repos/${options.repository}/`.length);
+  if (!(path in responses)) throw new Error(`unexpected ${path}`);
+  return { ok: true, json: async () => responses[path] };
+} });
+// A run created at minute 10 that failed, then reran at minute 30 and succeeded:
+// each attempt reports its own created_at, and the run reports the first.
+const rerun = {
+  'actions/runs/2/attempts/1': run(2, 10, 'failure', 11),
+  'actions/runs/2/attempts/2': run(2, 30, 'success', 31, { run_attempt: 2 }),
+  'actions/runs/2': run(2, 10, 'success', 31, { run_attempt: 2, run_started_at: time(30) }),
+};
+test('GitHub reads the requested attempt and the run creation time', async () => {
+  const attempt = await github(rerun).run(2, 2);
+  assert.equal(attempt.run_attempt, 2);
+  assert.equal(attempt.run_started_at, time(30));
+  assert.equal(attempt.created_at, time(10));
+  assert.equal((await github(rerun).run(2, 1)).conclusion, 'failure');
+});
+test('a rerun that turns a failure green recovers against the real attempt shape', async () => {
+  const api = github({ ...rerun, 'actions/workflows/42/runs?per_page=100&page=1': { workflow_runs: [rerun['actions/runs/2'], run(1, 0, 'success')] } });
+  assert.deepEqual(await evaluate(await api.run(2, 2), api, options), { kind: 'green', minutes: 20 });
+});
+test('a run created before the rerun but after the original attempt orders as newer', async () => {
+  const api = github({ ...rerun, 'actions/workflows/42/runs?per_page=100&page=1': { workflow_runs: [run(3, 20, 'success', 25), rerun['actions/runs/2'], run(1, 0, 'success')] } });
+  assert.deepEqual(await evaluate(await api.run(2, 2), api, options), { kind: 'none', reason: 'A newer run already held the effective verdict' });
 });
 test('GitHub refuses mismatched identities and API errors', async () => {
   const api = (response) => new GitHub({ repository: options.repository, token: 'token', fetchImpl: async () => response });
