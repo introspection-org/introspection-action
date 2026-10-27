@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.2](https://github.com/introspection-org/introspection-action/compare/v0.1.1...v0.1.2) (2026-10-27)
+
+
+### Features
+
+* count a timed-out run and a run that never started as red ([#8](https://github.com/introspection-org/introspection-action/issues/8)) ([80399a5](https://github.com/introspection-org/introspection-action/commit/80399a520c40eaf6a339e9b4e0894e79d088856c))
+
 ## [0.1.1](https://github.com/introspection-org/introspection-action/compare/v0.1.0...v0.1.1) (2026-10-27)
 
 
