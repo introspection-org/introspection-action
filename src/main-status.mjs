@@ -1,6 +1,9 @@
 import { appendFileSync, readFileSync } from 'node:fs';
 
-const verdict = (run) => ['success', 'failure'].includes(run.conclusion);
+// A run that failed, timed out or never started leaves the branch red; GitHub sends no
+// completion event for one that never started, so only a reconcile finds it.
+const red = (run) => ['failure', 'timed_out', 'startup_failure'].includes(run?.conclusion);
+const verdict = (run) => run.conclusion === 'success' || red(run);
 const positiveId = (value) => /^[1-9][0-9]*$/.test(String(value));
 const sameRepo = (a, b) => typeof a === 'string' && a.toLowerCase() === b.toLowerCase();
 const timestamp = (value) => typeof value === 'string' && /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/.test(value) && Number.isFinite(Date.parse(value));
@@ -195,10 +198,8 @@ async function settledPoints(target, api, options) {
 }
 
 function transition(current, previous) {
-  if (current.conclusion === 'failure') {
-    return previous?.conclusion === 'failure' ? { kind: 'none', reason: 'Workflow remains red' } : { kind: 'red' };
-  }
-  return previous?.conclusion === 'failure' ? { kind: 'green' } : { kind: 'none', reason: 'No failure to recover from' };
+  if (red(current)) return red(previous) ? { kind: 'none', reason: 'Workflow remains red' } : { kind: 'red' };
+  return red(previous) ? { kind: 'green' } : { kind: 'none', reason: 'No failure to recover from' };
 }
 
 // Minutes from the creation of the earliest run in the failure streak before `target` to
@@ -250,7 +251,7 @@ export async function evaluate(target, api, options) {
     if (settled.before && transition(current.held, before?.held).kind !== result.kind) result.late = true;
     return result;
   } catch (error) {
-    if (target.conclusion === 'failure') return { kind: 'red', uncertain: true, reason: error.message };
+    if (red(target)) return { kind: 'red', uncertain: true, reason: error.message };
     throw new HistoryError(`Previous verdict unknown; recovery withheld: ${error.message}`);
   }
 }

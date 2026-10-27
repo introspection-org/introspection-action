@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import test from 'node:test';
-import { configuration, deliver, eligible, evaluate, EVALUATION_TITLE, GitHub, HistoryError, main, RECONCILE_TITLE, render, validateRun } from '../src/main-status.mjs';
+import { configuration, deliver, eligible, evaluate, EVALUATION_TITLE, GitHub, HistoryError, latestVerdict, main, RECONCILE_TITLE, render, validateRun } from '../src/main-status.mjs';
 
 const options = { repository: 'example/project', mainBranch: 'main', releaseWorkflows: [], serverUrl: 'https://github.com' };
 const time = (minutes) => new Date(Date.UTC(2026, 9, 24, 0, minutes)).toISOString().replace('.000Z', 'Z');
@@ -51,7 +51,7 @@ test('recovery spans the whole failure streak through cancelled runs', async () 
   assert.deepEqual(result, { kind: 'green', minutes: 110 });
 });
 test('non-verdicts and incomplete runs read no history', async () => {
-  for (const conclusion of ['cancelled', 'skipped', 'timed_out', 'neutral', null]) {
+  for (const conclusion of ['cancelled', 'skipped', 'neutral', null]) {
     const api = history([]);
     assert.equal((await evaluate(run(2, 10, conclusion), api, options)).kind, 'none');
     assert.equal(api.calls.length, 0);
@@ -410,4 +410,26 @@ test('the README caller titles runs in the forms the evaluator parses', () => {
   assert.match(evaluated.replace('{0}', '12').replace('{1}', '3').replace('{2}', '42'), EVALUATION_TITLE);
   assert.match(evaluated.replace('{0}', '12').replace('{1}', '3').replace(' {2}', ''), EVALUATION_TITLE);
   assert.ok(readme.includes(`'${RECONCILE_TITLE}'`), 'README run-name lost its reconcile title');
+});
+test('a timed-out completion is red and a success after it recovers', async () => {
+  const ci = [run(3, 20, 'success'), run(2, 10, 'timed_out'), run(1, 0, 'success')];
+  assert.deepEqual(await evaluateRuns(ci[1], ci), { kind: 'red' });
+  assert.deepEqual(await evaluateRuns(ci[0], ci), { kind: 'green', minutes: 10 });
+});
+// GitHub's shape for a run whose workflow file is invalid: it completes as it is created,
+// and no completion event reaches a workflow_run subscriber.
+const neverStarted = (id, created) => run(id, created, 'startup_failure', created);
+test('a reconcile announces a run that never started', async () => {
+  const ci = [neverStarted(3, 20), run(2, 10, 'success'), run(1, 0, 'success')];
+  const reconciling = { ...recovering, reconcile: true, reconcileWorkflows: ['.github/workflows/ci.yml'], selfRunId: '901' };
+  const api = recorded(ci, [titled(2, 12, 'success'), titled(1, 2, 'success')]);
+  const latest = await latestVerdict(42, api, reconciling);
+  assert.equal(latest.id, 3);
+  assert.deepEqual(await evaluate(latest, api, reconciling), { kind: 'red' });
+});
+test('a success after a reconciled startup failure recovers', async () => {
+  const ci = [run(4, 40, 'success'), neverStarted(3, 20), run(2, 10, 'success')];
+  const reconciled = evaluation(870, 25, 'success', 'Main Status: reconcile');
+  const api = recorded(ci, [evaluation(900, 42, null, 'Main Status: run 4 attempt 1 of workflow 42'), reconciled, titled(2, 12, 'success')]);
+  assert.deepEqual(await evaluate(ci[0], api, { ...recovering, reconcileWorkflows: ['.github/workflows/ci.yml'] }), { kind: 'green', minutes: 20 });
 });
