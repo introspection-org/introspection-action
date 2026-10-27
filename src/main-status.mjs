@@ -5,7 +5,10 @@ const positiveId = (value) => /^[1-9][0-9]*$/.test(String(value));
 const sameRepo = (a, b) => typeof a === 'string' && a.toLowerCase() === b.toLowerCase();
 const timestamp = (value) => typeof value === 'string' && /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/.test(value) && Number.isFinite(Date.parse(value));
 const compare = (a, b) => a.created_at.localeCompare(b.created_at) || Math.sign(a.id - b.id);
-const escapeSlack = (value) => String(value).replaceAll(/[\r\n]/g, ' ').replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
+// One line, so external text cannot start a workflow command or a Slack line of its own.
+const oneLine = (value) => String(value).replaceAll(/[\r\n]/g, ' ');
+const escapeSlack = (value) => oneLine(value).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
+export const list = (value) => (value || '').split(',').map((item) => item.trim()).filter(Boolean);
 
 export class HistoryError extends Error {}
 
@@ -36,8 +39,15 @@ export class GitHub {
     this.base = `${apiUrl.replace(/\/$/, '')}/repos/${repository}`;
     this.token = token;
     this.fetch = fetchImpl;
+    this.cache = new Map();
   }
-  async get(path) {
+  // One read per path for the life of a job: completed runs and attempts do not change,
+  // and every evaluation in one job should see the same history.
+  get(path) {
+    if (!this.cache.has(path)) this.cache.set(path, this.read(path));
+    return this.cache.get(path);
+  }
+  async read(path) {
     let response;
     try {
       response = await this.fetch(`${this.base}/${path}`, {
@@ -63,6 +73,11 @@ export class GitHub {
       throw new Error('GitHub returned a different run or attempt');
     }
     return { ...run, created_at: latest.created_at };
+  }
+  async workflow(ref) {
+    const workflow = await this.get(`actions/workflows/${ref}`);
+    if (!Number.isSafeInteger(workflow?.id) || typeof workflow.name !== 'string') throw new Error('Workflow identity is missing');
+    return workflow;
   }
 }
 
@@ -101,9 +116,8 @@ class History {
       const page = await this.page(index);
       if (!page) break;
       for (const run of page) {
-        if (pending && compare(pending, run) > 0) { yield pending; pending = null; }
-        if (event && run.id === event.id) { if (pending) { yield pending; pending = null; } continue; }
-        yield run;
+        if (pending && compare(pending, run) >= 0) { yield pending; pending = null; }
+        if (run.id !== event?.id) yield run;
       }
     }
     if (pending) yield pending;
@@ -172,8 +186,10 @@ async function settledPoints(target, api, options) {
       point = { at: event.updated_at, event, inclusive: true };
     }
     const same = point.event?.id === target.id && point.event.run_attempt === target.run_attempt;
-    if (same || point.at > target.updated_at) found.covered = true;
-    else if (point.at < target.updated_at && (!found.before || point.at > found.before.at)) found.before = point;
+    if (same || point.at > target.updated_at) {
+      found.covered = true;
+      if (options.reconcile) break;
+    } else if (point.at < target.updated_at && (!found.before || point.at > found.before.at)) found.before = point;
   }
   return found;
 }
@@ -231,7 +247,7 @@ export async function evaluate(target, api, options) {
       const minutes = await streakMinutes(history, target, current.run, api, options);
       if (minutes !== null) result.minutes = minutes;
     }
-    if (transition(current.held, before?.held).kind !== result.kind) result.late = true;
+    if (settled.before && transition(current.held, before?.held).kind !== result.kind) result.late = true;
     return result;
   } catch (error) {
     if (target.conclusion === 'failure') return { kind: 'red', uncertain: true, reason: error.message };
@@ -280,13 +296,13 @@ export function configuration(env, event) {
   if (env.POST_FOR_REAL === 'true' && !env.SLACK_WEBHOOK_URL) throw new Error('Slack webhook is required when post_for_real is true');
   const automatic = env.GITHUB_EVENT_NAME === 'workflow_run';
   const reconcile = env.GITHUB_EVENT_NAME === 'schedule';
-  const list = (value) => (value || '').split(',').map((path) => path.trim()).filter(Boolean);
-  const runId = automatic ? event.workflow_run?.id : reconcile ? '' : env.INPUT_RUN_ID;
-  const attempt = automatic ? event.workflow_run?.run_attempt : reconcile ? '' : env.INPUT_RUN_ATTEMPT;
+  // Where each event takes the run it evaluates from; a reconcile chooses its own.
+  const [runId, attempt] = automatic ? [event.workflow_run?.id, event.workflow_run?.run_attempt]
+    : reconcile ? ['', ''] : [env.INPUT_RUN_ID, env.INPUT_RUN_ATTEMPT];
   if (runId && !positiveId(runId)) throw new Error('run_id must be a positive integer');
   if (attempt && (!runId || !positiveId(attempt))) throw new Error('run_attempt requires a run_id and must be a positive integer');
   if (automatic && (!runId || !attempt)) throw new Error('Completion event lacks run ID or attempt');
-  if (!automatic && !reconcile && env.GITHUB_EVENT_NAME !== 'workflow_dispatch' && env.POST_FOR_REAL === 'true') {
+  if (!['workflow_run', 'schedule', 'workflow_dispatch'].includes(env.GITHUB_EVENT_NAME) && env.POST_FOR_REAL === 'true') {
     throw new Error('Posting requires workflow_run, workflow_dispatch or schedule');
   }
   const reconcileWorkflows = list(env.RECONCILE_WORKFLOWS);
@@ -307,51 +323,45 @@ export async function main(env = process.env) {
   try {
     const options = configuration(env, JSON.parse(readFileSync(env.GITHUB_EVENT_PATH, 'utf8')));
     const api = new GitHub({ repository: options.repository, token: env.GH_TOKEN, apiUrl: env.GITHUB_API_URL });
+    // Reports a result under `label`, delivering it unless it is quiet.
+    const announce = async (label, result, text) => {
+      if (result.kind === 'none') {
+        console.log(result.reason);
+        summary(`Main Status${label}: ${result.reason}`);
+        return result;
+      }
+      console.log(text);
+      const delivery = await deliver(text, options);
+      console.log(delivery);
+      if (result.uncertain) console.log(`::warning::${oneLine(result.reason)}`);
+      summary(`Main Status${label}: ${result.kind}${result.uncertain ? ' (previous verdict unknown)' : ''}${result.late ? ' (late)' : ''}. ${delivery}`);
+      return result;
+    };
+    const evaluated = async (label, run, workflow) => {
+      const result = run ? await evaluate(run, api, options) : { kind: 'none', reason: 'No verdict yet' };
+      const text = result.kind === 'none' ? '' : render(result, result.run ?? run, options, (await workflow()).name);
+      return announce(label, result, text);
+    };
     if (options.reconcile) {
       const failures = [];
       for (const path of options.reconcileWorkflows) {
         try {
-          const workflow = await api.get(`actions/workflows/${path.split('/').pop()}`);
-          if (!Number.isSafeInteger(workflow.id) || typeof workflow.name !== 'string') throw new Error('Workflow identity is missing');
-          const run = await latestVerdict(workflow.id, api, options);
-          const result = run ? await evaluate(run, api, options) : { kind: 'none', reason: 'No verdict yet' };
-          if (result.kind === 'none') { console.log(`${path}: ${result.reason}`); summary(`Main Status ${path}: ${result.reason}`); continue; }
-          const text = render(result, result.run ?? run, options, workflow.name);
-          console.log(text);
-          const delivery = await deliver(text, options);
-          console.log(delivery);
-          summary(`Main Status ${path}: ${result.kind}${result.late ? ' (late)' : ''}. ${delivery}`);
+          const workflow = await api.workflow(path.split('/').pop());
+          await evaluated(` ${path}`, await latestVerdict(workflow.id, api, options), async () => workflow);
         } catch (error) {
-          console.log(`::error::${path}: ${error.message.replaceAll(/[\r\n]/g, ' ')}`);
+          console.log(`::error::${oneLine(`${path}: ${error.message}`)}`);
           failures.push(path);
         }
       }
       if (failures.length) throw new Error(`Reconcile incomplete for ${failures.join(', ')}`);
       return { kind: 'reconcile' };
     }
-    let text;
-    let result;
     if (!options.runId) {
-      result = { kind: 'diagnostic' };
-      text = `🧪 ${escapeSlack(options.repository.split('/')[1])}: Main Status test message from ${escapeSlack(env.GITHUB_ACTOR || 'unknown')}, not an alert\n<${options.serverUrl}/${options.repository}/actions/runs/${env.GITHUB_RUN_ID}|this run>`;
-    } else {
-      const run = await api.run(options.runId, options.attempt);
-      result = await evaluate(run, api, options);
-      if (result.kind === 'none') {
-        console.log(result.reason);
-        summary(`Main Status: ${result.reason}`);
-        return result;
-      }
-      const workflow = await api.get(`actions/workflows/${run.workflow_id}`);
-      if (typeof workflow.name !== 'string') throw new Error('Workflow name is missing');
-      text = render(result, result.run ?? run, options, workflow.name);
+      const text = `🧪 ${escapeSlack(options.repository.split('/')[1])}: Main Status test message from ${escapeSlack(env.GITHUB_ACTOR || 'unknown')}, not an alert\n<${options.serverUrl}/${options.repository}/actions/runs/${env.GITHUB_RUN_ID}|this run>`;
+      return announce('', { kind: 'diagnostic' }, text);
     }
-    console.log(text);
-    const delivery = await deliver(text, options);
-    console.log(delivery);
-    if (result.uncertain) console.log(`::warning::${result.reason.replaceAll(/[\r\n]/g, ' ')}`);
-    summary(`Main Status: ${result.kind}${result.uncertain ? ' (previous verdict unknown)' : ''}${result.late ? ' (late)' : ''}. ${delivery}`);
-    return result;
+    const run = await api.run(options.runId, options.attempt);
+    return evaluated('', run, () => api.workflow(run.workflow_id));
   } catch (error) {
     summary(`Main Status failed: ${error.message}`);
     throw error;

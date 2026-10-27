@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import test from 'node:test';
-import { configuration, deliver, eligible, evaluate, GitHub, HistoryError, main, render, validateRun } from '../src/main-status.mjs';
+import { configuration, deliver, eligible, evaluate, EVALUATION_TITLE, GitHub, HistoryError, main, RECONCILE_TITLE, render, validateRun } from '../src/main-status.mjs';
 
 const options = { repository: 'example/project', mainBranch: 'main', releaseWorkflows: [], serverUrl: 'https://github.com' };
 const time = (minutes) => new Date(Date.UTC(2026, 9, 24, 0, minutes)).toISOString().replace('.000Z', 'Z');
@@ -400,4 +400,12 @@ test('a scheduled reconcile sends the lost recovery of each listed workflow', as
     { kind: 'reconcile' });
   } finally { globalThis.fetch = original; }
   assert.match(readFileSync(join(dir, 'summary'), 'utf8'), /ci\.yml: green \(late\)\. Slack post withheld/);
+});
+test('the README caller titles runs in the forms the evaluator parses', () => {
+  const readme = readFileSync(new URL('../README.md', import.meta.url), 'utf8');
+  const evaluated = /format\('(Main Status: run \{0\} attempt \{1\} of workflow \{2\})'/.exec(readme)?.[1];
+  assert.ok(evaluated, 'README run-name lost its evaluation title');
+  assert.match(evaluated.replace('{0}', '12').replace('{1}', '3').replace('{2}', '42'), EVALUATION_TITLE);
+  assert.match(evaluated.replace('{0}', '12').replace('{1}', '3').replace(' {2}', ''), EVALUATION_TITLE);
+  assert.ok(readme.includes(`'${RECONCILE_TITLE}'`), 'README run-name lost its reconcile title');
 });
