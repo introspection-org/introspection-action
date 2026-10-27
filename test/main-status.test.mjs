@@ -306,10 +306,12 @@ test('an evaluation answers for its completion even when a later one already ran
   assert.deepEqual(await evaluate(ci[1], api, { ...recovering, selfRunId: '802' }), { kind: 'green', minutes: 10 });
 });
 test('two completions evaluated concurrently send both red and recovery', async () => {
-  const ci = [run(2, 10, 'success', 13), run(1, 0, 'failure', 11)];
-  const both = [titled(2, 14, null), titled(1, 12, null)];
-  assert.deepEqual(await evaluate(ci[1], recorded(ci, both), { ...recovering, selfRunId: '801' }), { kind: 'red' });
-  assert.deepEqual(await evaluate(ci[0], recorded(ci, both), { ...recovering, selfRunId: '802' }), { kind: 'green', minutes: 10 });
+  // Run 1's settled success is what a recovery would wrongly compare with if run 2's
+  // unfinished evaluation were not counted as settled.
+  const ci = [run(3, 10, 'success', 13), run(2, 5, 'failure', 11), run(1, 0, 'success', 1)];
+  const all = [titled(3, 14, null), titled(2, 12, null), titled(1, 2, 'success')];
+  assert.deepEqual(await evaluate(ci[1], recorded(ci, all), { ...recovering, selfRunId: '802' }), { kind: 'red' });
+  assert.deepEqual(await evaluate(ci[0], recorded(ci, all), { ...recovering, selfRunId: '803' }), { kind: 'green', minutes: 5 });
 });
 test('a settled completion tied with the target keeps the order unknown', async () => {
   const ci = [run(3, 20, 'success', 30), run(2, 10, 'failure', 30), run(1, 0, 'success')];
