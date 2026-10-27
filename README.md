@@ -61,7 +61,7 @@ The caller's Actions settings must allow this public reusable workflow. Its toke
 | `post_for_real` | `false` | Rehearsals print the notification without sending it. Posting requires a nonempty webhook, including invocations with no transition. |
 | Secret `slack_webhook_url` | Empty | Required at runtime when posting is enabled; optional for rehearsals. |
 
-API requests use the caller's `github.repository`, `github.token`, and API server. Generated links use the caller's GitHub server URL. Only completed `success` and `failure` conclusions carry verdicts; cancelled, timed-out, skipped, and other conclusions do not. PR events and foreign head repositories are excluded from both the target and history. Release Please remains mainline unless explicitly classified otherwise.
+API requests use the caller's `github.repository`, `github.token`, and API server. Generated links use the caller's GitHub server URL. Completed `success` conclusions carry a green verdict, and `failure`, `timed_out` and `startup_failure` a red one; cancelled, skipped, and other conclusions carry none. GitHub sends no completion event for a run that never started, so the hourly reconcile is what announces a `startup_failure`; a caller filtering `workflow_run` by conclusion must let `timed_out` through. PR events and foreign head repositories are excluded from both the target and history. Release Please remains mainline unless explicitly classified otherwise.
 
 ## Transition semantics
 
