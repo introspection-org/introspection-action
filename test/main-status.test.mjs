@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import test from 'node:test';
-import { configuration, deliver, eligible, evaluate, GitHub, HistoryError, render, validateRun } from '../src/main-status.mjs';
+import { configuration, deliver, eligible, evaluate, EVALUATION_TITLE, GitHub, HistoryError, main, RECONCILE_TITLE, render, validateRun } from '../src/main-status.mjs';
 
 const options = { repository: 'example/project', mainBranch: 'main', releaseWorkflows: [], serverUrl: 'https://github.com' };
 const time = (minutes) => new Date(Date.UTC(2026, 9, 24, 0, minutes)).toISOString().replace('.000Z', 'Z');
@@ -243,4 +243,171 @@ test('deleted head repositories are excluded rather than poisoning history', asy
 test('metadata cannot inject workflow command lines into logs', () => {
   const text = render({ kind: 'red' }, run(2, 10, 'failure', 11, { head_commit: { author: { name: 'name\n::error::injected' } } }), options, 'CI\n::error::injected');
   assert.doesNotMatch(text, /\n::error::/);
+});
+
+// Self-recovery: each Main Status run is titled with the completion it evaluates, so a
+// later evaluation compares against the last one that completed rather than the last edge.
+const recovering = { ...options, statusWorkflow: 'main-status.yml', selfRunId: '900', reconcileWorkflows: [] };
+const evaluation = (id, created, conclusion, title, extra = {}) => run(id, created, conclusion, created + 1, {
+  workflow_id: 7, path: '.github/workflows/main-status.yml', event: 'workflow_run', display_title: title, ...extra,
+});
+const titled = (ci, created, conclusion, extra) => evaluation(800 + ci, created, conclusion, `Main Status: run ${ci} attempt 1 of workflow 42`, extra);
+// Serves CI history, Main Status history and each CI run's attempt; later pages are empty.
+function recorded(ciRuns, evaluations) {
+  const responses = {
+    'actions/workflows/42/runs?per_page=100&page=1': { workflow_runs: ciRuns },
+    'actions/workflows/main-status.yml/runs?per_page=100&page=1': { workflow_runs: evaluations },
+  };
+  for (const ci of ciRuns) Object.assign(responses, { [`actions/runs/${ci.id}`]: ci, [`actions/runs/${ci.id}/attempts/1`]: ci });
+  return new GitHub({ repository: options.repository, token: 'token', fetchImpl: async (url) => {
+    const path = url.slice(`https://api.github.com/repos/${options.repository}/`.length);
+    if (path in responses) return { ok: true, json: async () => responses[path] };
+    if (/\/runs\?per_page=100&page=\d+$/.test(path)) return { ok: true, json: async () => ({ workflow_runs: [] }) };
+    throw new Error(`unexpected ${path}`);
+  } });
+}
+const self = evaluation(900, 22, null, 'Main Status: run 3 attempt 1 of workflow 42');
+
+test('a red whose evaluation was lost is sent at the next failure', async () => {
+  const ci = [run(3, 20, 'failure'), run(2, 10, 'failure'), run(1, 0, 'success')];
+  const api = recorded(ci, [self, titled(2, 12, 'failure'), titled(1, 2, 'success')]);
+  assert.deepEqual(await evaluate(ci[0], api, recovering), { kind: 'red', late: true });
+});
+test('a recovery whose evaluation was lost is sent at the next success', async () => {
+  const ci = [run(3, 20, 'success'), run(2, 10, 'success'), run(1, 0, 'failure')];
+  const api = recorded(ci, [self, titled(2, 12, 'failure'), titled(1, 2, 'success')]);
+  assert.deepEqual(await evaluate(ci[0], api, recovering), { kind: 'green', late: true });
+});
+test('an evaluation that never started is lost like one that failed', async () => {
+  const ci = [run(3, 20, 'success'), run(2, 10, 'success'), run(1, 0, 'failure')];
+  const blocked = titled(2, 12, 'failure', { run_started_at: time(12) });
+  assert.equal((await evaluate(ci[0], recorded(ci, [self, blocked, titled(1, 2, 'success')]), recovering)).late, true);
+});
+test('a completed evaluation is not repeated', async () => {
+  const ci = [run(3, 20, 'success'), run(2, 10, 'success'), run(1, 0, 'failure')];
+  const api = recorded(ci, [self, titled(2, 12, 'success'), titled(1, 2, 'success')]);
+  assert.deepEqual(await evaluate(ci[0], api, recovering), { kind: 'none', reason: 'No failure to recover from' });
+});
+test('an unfinished evaluation counts as settled, so a recovery after it is not late', async () => {
+  const ci = [run(3, 20, 'success'), run(2, 10, 'failure'), run(1, 0, 'success')];
+  const api = recorded(ci, [self, titled(2, 12, null), titled(1, 2, 'success')]);
+  assert.deepEqual(await evaluate(ci[0], api, recovering), { kind: 'green', minutes: 10 });
+});
+test('a reconcile stays quiet for a completion a later or repeated evaluation settled', async () => {
+  const ci = [run(3, 20, 'failure'), run(2, 10, 'success'), run(1, 0, 'failure')];
+  const reconciling = { ...recovering, reconcile: true, selfRunId: '901' };
+  assert.deepEqual(await evaluate(ci[1], recorded(ci, [titled(3, 22, 'success'), titled(1, 2, 'success')]), reconciling),
+    { kind: 'none', reason: 'A later evaluation already settled this workflow' });
+  assert.equal((await evaluate(ci[0], recorded(ci, [titled(3, 22, 'success'), titled(1, 2, 'success')]), reconciling)).kind, 'none');
+});
+test('an evaluation answers for its completion even when a later one already ran', async () => {
+  const ci = [run(3, 20, 'failure'), run(2, 10, 'success'), run(1, 0, 'failure')];
+  const api = recorded(ci, [titled(3, 22, 'success'), titled(2, 12, 'success'), titled(1, 2, 'success')]);
+  assert.deepEqual(await evaluate(ci[1], api, { ...recovering, selfRunId: '802' }), { kind: 'green', minutes: 10 });
+});
+test('two completions evaluated concurrently send both red and recovery', async () => {
+  // Run 1's settled success is what a recovery would wrongly compare with if run 2's
+  // unfinished evaluation were not counted as settled.
+  const ci = [run(3, 10, 'success', 13), run(2, 5, 'failure', 11), run(1, 0, 'success', 1)];
+  const all = [titled(3, 14, null), titled(2, 12, null), titled(1, 2, 'success')];
+  assert.deepEqual(await evaluate(ci[1], recorded(ci, all), { ...recovering, selfRunId: '802' }), { kind: 'red' });
+  assert.deepEqual(await evaluate(ci[0], recorded(ci, all), { ...recovering, selfRunId: '803' }), { kind: 'green', minutes: 5 });
+});
+test('a settled completion tied with the target keeps the order unknown', async () => {
+  const ci = [run(3, 20, 'success', 30), run(2, 10, 'failure', 30), run(1, 0, 'success')];
+  await assert.rejects(evaluate(ci[0], recorded(ci, [self, titled(2, 31, 'success'), titled(1, 2, 'success')]), recovering), /timestamp/);
+});
+test('a later manual evaluation of an old completion does not move the comparison back', async () => {
+  const ci = [run(4, 30, 'failure'), run(3, 20, 'success'), run(2, 10, 'failure'), run(1, 0, 'success')];
+  const redispatch = evaluation(860, 25, 'success', 'Main Status: run 2 attempt 1 of workflow ');
+  const api = recorded(ci, [evaluation(900, 32, null, 'Main Status: run 4 attempt 1 of workflow 42'), redispatch, titled(3, 22, 'success'), titled(2, 12, 'success')]);
+  assert.deepEqual(await evaluate(ci[0], api, recovering), { kind: 'red' });
+});
+test('a late notification names the newer run that holds the verdict', async () => {
+  const ci = [run(3, 10, 'failure', 12), run(2, 5, 'success', 20), run(1, 0, 'success', 1)];
+  const api = recorded(ci, [evaluation(900, 21, null, 'Main Status: run 2 attempt 1 of workflow 42'), titled(3, 13, 'failure'), titled(1, 2, 'success')]);
+  const result = await evaluate(ci[1], api, recovering);
+  assert.deepEqual([result.kind, result.late, result.run?.id], ['red', true, 3]);
+});
+test('a first reconcile over untitled history stays quiet', async () => {
+  const ci = [run(2, 10, 'success'), run(1, 0, 'failure')];
+  const api = recorded(ci, [evaluation(850, 12, 'success', 'Main Status')]);
+  assert.deepEqual(await evaluate(ci[0], api, { ...recovering, reconcile: true }), { kind: 'none', reason: 'No titled evaluation to compare with' });
+});
+test('an ineligible titled evaluation costs one read and is skipped', async () => {
+  const ci = [run(3, 20, 'failure'), run(2, 10, 'failure'), run(1, 0, 'success')];
+  const pr = run(5, 15, 'failure', 16, { event: 'pull_request', head_branch: 'feature' });
+  const reads = [];
+  const api = recorded([...ci, pr], [self, titled(5, 17, 'success'), titled(2, 12, 'failure'), titled(1, 2, 'success')]);
+  const original = api.fetch; api.fetch = async (url, init) => { reads.push(url); return original(url, init); };
+  assert.deepEqual(await evaluate(ci[0], api, recovering), { kind: 'red', late: true });
+  assert.equal(reads.filter((url) => /actions\/runs\/5(\/|$)/.test(url)).length, 1);
+});
+test('evaluations of other workflows, rehearsals and unparsed titles are skipped without reads', async () => {
+  const ci = [run(3, 20, 'failure'), run(2, 10, 'failure'), run(1, 0, 'success')];
+  const others = [
+    evaluation(851, 15, 'success', 'Main Status: run 99 attempt 1 of workflow 5'),
+    evaluation(852, 14, 'success', 'Main Status: rehearsal'),
+    evaluation(853, 13, 'success', 'Main Status: run  attempt  of workflow '),
+  ];
+  const api = recorded(ci, [self, ...others, titled(2, 12, 'failure'), titled(1, 2, 'success')]);
+  assert.deepEqual(await evaluate(ci[0], api, recovering), { kind: 'red', late: true });
+});
+test('a dispatch title without a workflow id is resolved by reading its run', async () => {
+  const ci = [run(3, 20, 'success'), run(2, 10, 'success'), run(1, 0, 'failure')];
+  const dispatched = evaluation(860, 30, 'success', 'Main Status: run 2 attempt 1 of workflow ');
+  assert.equal((await evaluate(ci[0], recorded(ci, [self, dispatched, titled(2, 12, 'failure')]), recovering)).kind, 'none');
+});
+test('history before titled evaluations falls back to the immediate predecessor', async () => {
+  const ci = [run(3, 20, 'failure'), run(2, 10, 'failure'), run(1, 0, 'success')];
+  const api = recorded(ci, [self, evaluation(850, 12, 'failure', 'Main Status'), titled(1, 2, 'success')]);
+  assert.deepEqual(await evaluate(ci[0], api, recovering), { kind: 'none', reason: 'Workflow remains red' });
+});
+test('a reconcile settles the workflows it lists', async () => {
+  const ci = [run(3, 20, 'failure'), run(2, 10, 'success')];
+  const reconciled = evaluation(870, 25, 'success', 'Main Status: reconcile');
+  const listed = { ...recovering, reconcileWorkflows: ['.github/workflows/ci.yml'] };
+  assert.equal((await evaluate(ci[0], recorded(ci, [self, reconciled]), { ...listed, reconcile: true })).reason, 'A later evaluation already settled this workflow');
+  const lost = [run(3, 20, 'failure'), run(2, 10, 'failure'), run(1, 0, 'success')];
+  const history = [self, titled(2, 12, 'failure'), evaluation(871, 5, 'success', 'Main Status: reconcile')];
+  assert.deepEqual(await evaluate(lost[0], recorded(lost, history), listed), { kind: 'red', late: true });
+  assert.deepEqual(await evaluate(lost[0], recorded(lost, history), recovering), { kind: 'none', reason: 'Workflow remains red' });
+});
+test('renderer marks a late notification and omits an unknown red duration', () => {
+  const text = render({ kind: 'green', late: true }, run(2, 10, 'success'), options, 'CI');
+  assert.match(text, /CI is green again \(late: an earlier evaluation did not complete\)\n/);
+  assert.match(render({ kind: 'red', late: true }, run(2, 10, 'failure'), options, 'CI'), /CI failed \(late: /);
+});
+test('configuration reads the status workflow and requires a reconcile list on schedule', () => {
+  const env = { POST_FOR_REAL: 'false', GITHUB_EVENT_NAME: 'workflow_run', GITHUB_RUN_ID: '900',
+    STATUS_WORKFLOW_REF: 'example/project/.github/workflows/main-status.yml@refs/heads/main' };
+  const config = configuration(env, { workflow_run: { id: 3, run_attempt: 1 } });
+  assert.equal(config.statusWorkflow, 'main-status.yml'); assert.equal(config.selfRunId, '900');
+  assert.throws(() => configuration({ ...env, GITHUB_EVENT_NAME: 'schedule' }, {}), /reconcile_workflows/);
+  const scheduled = configuration({ ...env, GITHUB_EVENT_NAME: 'schedule', RECONCILE_WORKFLOWS: 'a.yml, b.yml', POST_FOR_REAL: 'true', SLACK_WEBHOOK_URL: 'x' }, {});
+  assert.deepEqual([scheduled.reconcile, scheduled.reconcileWorkflows, scheduled.runId], [true, ['a.yml', 'b.yml'], '']);
+});
+test('a scheduled reconcile sends the lost recovery of each listed workflow', async () => {
+  const ci = [run(3, 20, 'success'), run(2, 10, 'success'), run(1, 0, 'failure')];
+  const api = recorded(ci, [titled(3, 22, 'failure'), titled(2, 12, 'failure'), titled(1, 2, 'success')]);
+  const original = globalThis.fetch;
+  globalThis.fetch = async (url, init) => url.endsWith('/actions/workflows/ci.yml')
+    ? { ok: true, json: async () => ({ id: 42, name: 'CI' }) } : api.fetch(url, init);
+  const dir = mkdtempSync(join(tmpdir(), 'main-status-'));
+  writeFileSync(join(dir, 'event.json'), '{}');
+  try {
+    assert.deepEqual(await main({ POST_FOR_REAL: 'false', GITHUB_EVENT_NAME: 'schedule', GITHUB_RUN_ID: '900', GH_TOKEN: 'token',
+      GITHUB_REPOSITORY: options.repository, GITHUB_EVENT_PATH: join(dir, 'event.json'), GITHUB_STEP_SUMMARY: join(dir, 'summary'),
+      RECONCILE_WORKFLOWS: '.github/workflows/ci.yml', STATUS_WORKFLOW_REF: 'example/project/.github/workflows/main-status.yml@refs/heads/main' }),
+    { kind: 'reconcile' });
+  } finally { globalThis.fetch = original; }
+  assert.match(readFileSync(join(dir, 'summary'), 'utf8'), /ci\.yml: green \(late\)\. Slack post withheld/);
+});
+test('the README caller titles runs in the forms the evaluator parses', () => {
+  const readme = readFileSync(new URL('../README.md', import.meta.url), 'utf8');
+  const evaluated = /format\('(Main Status: run \{0\} attempt \{1\} of workflow \{2\})'/.exec(readme)?.[1];
+  assert.ok(evaluated, 'README run-name lost its evaluation title');
+  assert.match(evaluated.replace('{0}', '12').replace('{1}', '3').replace('{2}', '42'), EVALUATION_TITLE);
+  assert.match(evaluated.replace('{0}', '12').replace('{1}', '3').replace(' {2}', ''), EVALUATION_TITLE);
+  assert.ok(readme.includes(`'${RECONCILE_TITLE}'`), 'README run-name lost its reconcile title');
 });

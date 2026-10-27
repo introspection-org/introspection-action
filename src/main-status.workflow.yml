@@ -18,6 +18,10 @@ on:
         description: Comma-separated workflow paths whose non-PR runs count on any branch or tag
         type: string
         default: ''
+      reconcile_workflows:
+        description: Comma-separated workflow paths a scheduled run reconciles; list every subscribed workflow
+        type: string
+        default: ''
       post_for_real:
         type: boolean
         default: false
@@ -38,6 +42,8 @@ jobs:
           INPUT_RUN_ATTEMPT: ${{ inputs.run_attempt }}
           MAIN_BRANCH: ${{ inputs.main_branch }}
           RELEASE_WORKFLOWS: ${{ inputs.release_workflows }}
+          RECONCILE_WORKFLOWS: ${{ inputs.reconcile_workflows }}
+          STATUS_WORKFLOW_REF: ${{ github.workflow_ref }}
           POST_FOR_REAL: ${{ inputs.post_for_real }}
           SLACK_WEBHOOK_URL: ${{ inputs.post_for_real && secrets.slack_webhook_url || '' }}
         shell: bash
